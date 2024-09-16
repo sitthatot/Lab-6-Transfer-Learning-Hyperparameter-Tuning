@@ -1,23 +1,22 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import torchvision.models as models
 import torchvision.transforms as transforms
-from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader,Subset,Dataset
-
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import random
-import os
-import cv2
-from skimage.util import random_noise
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import os
+import cv2
+import ray
+from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+from ray.air import session
 
+# Set random seed
 seed = 4912
 random.seed(seed)
 np.random.seed(seed)
@@ -26,7 +25,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
+# Your CustomImageDataset class here (unchanged)
 ### START CODE HERE ###
 class CustomImageDataset(Dataset):
     def __init__(self, image_paths,gauss_noise=False,gauss_blur=None,resize=128,p=0.5, center_crop=False, transform=None):
@@ -74,6 +73,9 @@ class CustomImageDataset(Dataset):
 
     def __getitem__(self, idx):
         image_paths = self.image_paths[idx]
+        if not os.path.exists(image_paths):
+            print(f"File {image_paths} not found, skipping.")
+            return torch.zeros((3, self.resize, self.resize)), 0  # Handle this case in the training loop
         img = plt.imread(image_paths)
         if img.ndim == 2: #ถ้าเป็น Gray --> บังคับเป็น RGB Format
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
@@ -107,62 +109,6 @@ class CustomImageDataset(Dataset):
             gt_image = self.transform(gt_image)
         return image, gt_image
 ### END CODE HERE ###
-
-### START CODE HERE ###
-data_dir = "data/img_align_celeba"
-image_paths = []
-for file_name in os.listdir(data_dir):
-    image_paths.append(f"{data_dir}/{file_name}")
-print(image_paths)
-
-transform = transforms.Compose([transforms.ToTensor()])
-
-dataset = CustomImageDataset(image_paths=image_paths,
-                             gauss_noise=True,
-                             gauss_blur=True,
-                             resize=128,
-                             p=0.5,
-                             center_crop=True,
-                             transform=transform
-                            )
-dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
-### END CODE HERE ###
-
-batch,gt_img = next(iter(dataloader)) 
-print(batch.shape)
-torch.is_tensor(batch)
-
-### START CODE HERE ###
-class DownSamplingBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super(DownSamplingBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        return x
-
-class UpSamplingBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super(UpSamplingBlock, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU()
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.upsample(x)
-        return x
-
 
 ### START CODE HERE ###
 class DownSamplingBlock(nn.Module):
@@ -203,24 +149,28 @@ class Autoencoder(nn.Module):
         #Encoder
         
         if len(self.architecture)  == 3:
-            print("this is 3")
-            print(type(self.architecture[0]))
-            print("==================")
-            print(int(self.architecture[0]))
-            # self.conv_in = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
-            # self.down1 = DownSamplingBlock(64, 128, kernel_size=3, stride=1, padding=1)
-            # ### DESIGN YOUR OWN MODEL ###
-            # self.down2 = DownSamplingBlock(128, 256, kernel_size=3, stride=1, padding=1)
-            # #Decoder
-            # self.up3 = UpSamplingBlock(256, 128, kernel_size=3, stride=1, padding=1)
-            # self.up4 = UpSamplingBlock(128, 64, kernel_size=3, stride=1, padding=1)
-            # self.conv = nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+            # print("this is 3")
+            # print(self.architecture[0])
+            self.conv_in = nn.Conv2d(3, self.architecture[0], kernel_size=3, stride=1, padding=1)
+            self.down1 = DownSamplingBlock(self.architecture[0], self.architecture[1], kernel_size=3, stride=1, padding=1)
+            ### DESIGN YOUR OWN MODEL ###
+            self.down2 = DownSamplingBlock(self.architecture[1], self.architecture[2], kernel_size=3, stride=1, padding=1)
+            #Decoder
+            self.up3 = UpSamplingBlock(self.architecture[2], self.architecture[1], kernel_size=3, stride=1, padding=1)
+            self.up4 = UpSamplingBlock(self.architecture[1], self.architecture[0], kernel_size=3, stride=1, padding=1)
+            self.conv = nn.Conv2d(self.architecture[0], 3, kernel_size=3, stride=1, padding=1)
         elif len(self.architecture)  == 4:
-            print("this is 4")
-            print(type(self.architecture[0]))
-            print("==================")
-            print(int(self.architecture[0]))
-            # print(self.architecture)
+            # print("this is 4")
+            self.conv_in = nn.Conv2d(3, self.architecture[0], kernel_size=3, stride=1, padding=1)
+            self.down1 = DownSamplingBlock(self.architecture[0], self.architecture[1], kernel_size=3, stride=1, padding=1)
+            ### DESIGN YOUR OWN MODEL ###
+            self.down2 = DownSamplingBlock(self.architecture[1], self.architecture[2], kernel_size=3, stride=1, padding=1)
+            self.down3 = DownSamplingBlock(self.architecture[2], self.architecture[3], kernel_size=3, stride=1, padding=1)
+            #Decoder
+            self.up4 = UpSamplingBlock(self.architecture[3], self.architecture[2], kernel_size=3, stride=1, padding=1)
+            self.up5 = UpSamplingBlock(self.architecture[2], self.architecture[1], kernel_size=3, stride=1, padding=1)
+            self.up6 = UpSamplingBlock(self.architecture[1], self.architecture[0], kernel_size=3, stride=1, padding=1)
+            self.conv = nn.Conv2d(self.architecture[0], 3, kernel_size=3, stride=1, padding=1)
     #     self.conv_in = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
     #     self.down1 = DownSamplingBlock(64, 128, kernel_size=3, stride=1, padding=1)
     #     ### DESIGN YOUR OWN MODEL ###
@@ -230,22 +180,53 @@ class Autoencoder(nn.Module):
     #     self.up4 = UpSamplingBlock(128, 64, kernel_size=3, stride=1, padding=1)
     #     self.conv = nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
 
-    # def forward(self, x):
-    #     x = self.conv_in(x)
-    #     x = self.down1(x)
-    #     x = self.down2(x)
-        
-    #     x = self.up3(x)
-    #     x = self.up4(x)
-    #     x = self.conv(x)
-    #     return x
+    def forward(self, x):
+        if len(self.architecture)  == 3:
+            x = self.conv_in(x)
+            x = self.down1(x)
+            x = self.down2(x)
+            
+            x = self.up3(x)
+            x = self.up4(x)
+            x = self.conv(x)
+        if len(self.architecture)  == 4:
+            x = self.conv_in(x)
+            x = self.down1(x)
+            x = self.down2(x)
+            x = self.down3(x)
+            
+            x = self.up4(x)
+            x = self.up5(x)
+            x = self.up6(x)
+            x = self.conv(x)
+        return x
 ### END CODE HERE ###
 
-from ray import tune
-from ray.tune.schedulers import ASHAScheduler
-
-def short_dirname(trial):
-    return "trial_" + str(trial.trial_id)
+def load_data(data_dir, batch_size):
+    image_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.jpg')]
+    train_files, test_files = train_test_split(image_paths, test_size=0.2, random_state=42)
+    
+    transform = transforms.Compose([transforms.ToTensor()])
+    
+    train_dataset = CustomImageDataset(image_paths=train_files,
+                                       gauss_noise=True,
+                                       gauss_blur=True,
+                                       resize=128,
+                                       p=0.5,
+                                       center_crop=True,
+                                       transform=transform)
+    test_dataset = CustomImageDataset(image_paths=test_files,
+                                      gauss_noise=True,
+                                      gauss_blur=True,
+                                      resize=128,
+                                      p=0.5,
+                                      center_crop=True,
+                                      transform=transform)
+    
+    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    return trainloader, testloader
 
 def train_model(config):
     # Extract hyperparameters from config
@@ -253,26 +234,95 @@ def train_model(config):
     lr = config["lr"]
     batch_size = config["batch_size"]
     num_epochs = config["num_epochs"]
-    optimizer = config["optimizer"]
-
-    model = Autoencoder(architecture)
+    optimizer_name = config["optimizer"]
     
-    # Example training code
-    print(f"Training with lr={lr} and batch_size={batch_size}, {architecture},{num_epochs},{optimizer}")
+    # Load data
+    data_dir = os.path.abspath("data/img_align_celeba")  # Make sure this path is correct
+    trainloader, testloader = load_data(data_dir, batch_size)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = Autoencoder(architecture).to(device)
+    loss_fn = nn.MSELoss()
+    
+    if optimizer_name == 'Adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_name == 'SGD':
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        for batch, gt_img in trainloader:
+            batch, gt_img = batch.to(device), gt_img.to(device)
+            optimizer.zero_grad()
+            outputs = model(batch)
+            loss = loss_fn(outputs, gt_img)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        model.eval()
+        val_loss = 0.0
+        total_psnr = 0.0
+        total_ssim = 0.0
+        with torch.no_grad():
+            for batch, gt_img in testloader:
+                batch, gt_img = batch.to(device), gt_img.to(device)
+                outputs = model(batch)
+                loss = loss_fn(outputs, gt_img)
+                val_loss += loss.item()
+                
+                # Calculate PSNR and SSIM
+                img_np = gt_img.cpu().numpy().transpose(0, 2, 3, 1)
+                out_np = outputs.cpu().numpy().transpose(0, 2, 3, 1)
+                total_psnr += psnr(img_np, out_np, data_range=1.0)
+                total_ssim += ssim(img_np, out_np, data_range=1.0, multichannel=True)
+        
+        avg_train_loss = train_loss / len(trainloader)
+        avg_val_loss = val_loss / len(testloader)
+        avg_psnr = total_psnr / len(testloader)
+        avg_ssim = total_ssim / len(testloader)
+        
+        # Report results to Ray Tune
+        session.report({
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "val_psnr": avg_psnr,
+            "val_ssim": avg_ssim,
+        })
+
+# Ray Tune setup
+ray.shutdown()
+ray.init(num_gpus=1, ignore_reinit_error=True)
 
 config = {
     'architecture': tune.choice([[32, 64, 128], [64, 128, 256], [64, 128, 256, 512]]),
-    "lr": tune.grid_search([1e-3, 1e-4, 1e-2]),
-    "batch_size": tune.grid_search([16, 32]),
-    "num_epochs": tune.grid_search([10, 50, 100]),
+    "lr": tune.loguniform(1e-4, 1e-2),
+    "batch_size": tune.choice([16, 32]),
+    "num_epochs": tune.choice([10, 50, 100]),
     'optimizer': tune.choice(['Adam', 'SGD']),
 }
 
-tune.run(
+scheduler = ASHAScheduler(
+    max_t=100,
+    grace_period=10,
+    reduction_factor=2)
+
+tuner = tune.Tuner(
     train_model,
-    config=config,
-    num_samples=2,  # Number of trials
-    trial_dirname_creator=short_dirname,
+    tune_config=tune.TuneConfig(
+        metric="val_loss",
+        mode="min",
+        scheduler=scheduler,
+        num_samples=10,
+    ),
+    param_space=config,
 )
 
-# model = Autoencoder(architecture)
+results = tuner.fit()
+
+print("Best hyperparameters found were: ", results.get_best_result().config)
+
+# # Visualization function (if needed)
+# def imshow_grid(images):
+#     # ... (your existing implementation)
