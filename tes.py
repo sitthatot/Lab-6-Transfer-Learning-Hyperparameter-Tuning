@@ -1,22 +1,23 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
+import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, Dataset
-from sklearn.model_selection import train_test_split
-from skimage.metrics import peak_signal_noise_ratio as psnr
-from skimage.metrics import structural_similarity as ssim
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader,Subset,Dataset
+
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 import random
 import os
 import cv2
-import ray
-from ray import tune
-from ray.tune.schedulers import ASHAScheduler
-from ray.air import session
+from skimage.util import random_noise
+from sklearn.model_selection import train_test_split
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
 
-# Set random seed
 seed = 4912
 random.seed(seed)
 np.random.seed(seed)
@@ -25,7 +26,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# Your CustomImageDataset class here (unchanged)
 ### START CODE HERE ###
 class CustomImageDataset(Dataset):
     def __init__(self, image_paths,gauss_noise=False,gauss_blur=None,resize=128,p=0.5, center_crop=False, transform=None):
@@ -107,7 +107,53 @@ class CustomImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
             gt_image = self.transform(gt_image)
+        # Print shapes for debugging
+        # print(f"Image shape: {image.shape}")
+        # print(f"GT image shape: {gt_image.shape}")
         return image, gt_image
+### END CODE HERE ###
+
+### START CODE HERE ###
+data_dir = r"D:\Image Processing\LAB6_Hyperparameter-Tuning\data\img_align_celeba"
+image_paths = []
+for file_name in os.listdir(data_dir):
+    image_paths.append(f"{data_dir}/{file_name}")
+print(image_paths)
+
+transform = transforms.Compose([transforms.ToTensor()])
+
+dataset = CustomImageDataset(image_paths=image_paths,
+                             gauss_noise=True,
+                             gauss_blur=True,
+                             resize=128,
+                             p=0.5,
+                             center_crop=True,
+                             transform=transform
+                            )
+dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
+
+transform = transforms.Compose([transforms.ToTensor()])
+train_files, test_files = train_test_split(image_paths, test_size=0.2, random_state=42)
+train_dataset = CustomImageDataset(image_paths=train_files,
+                            gauss_noise=True,
+                            gauss_blur=True,
+                            resize=128,
+                            p=0.5,
+                            center_crop=True,
+                            transform=transform)
+test_dataset = CustomImageDataset(image_paths=test_files,
+                            gauss_noise=True,
+                            gauss_blur=True,
+                            resize=128,
+                            p=0.5,
+                            center_crop=True,
+                            transform=transform)
+trainloader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=0)
+testloader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=0)
+
+train_batch, train_gt = next(iter(trainloader)) 
+test_batch, test_gt = next(iter(testloader)) 
+
 ### END CODE HERE ###
 
 ### START CODE HERE ###
@@ -199,34 +245,27 @@ class Autoencoder(nn.Module):
             x = self.up5(x)
             x = self.up6(x)
             x = self.conv(x)
+        # print(f"Model output shape: {x.shape}")
         return x
 ### END CODE HERE ###
 
-def load_data(data_dir, batch_size):
-    image_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.jpg')]
-    train_files, test_files = train_test_split(image_paths, test_size=0.2, random_state=42)
-    
-    transform = transforms.Compose([transforms.ToTensor()])
-    
-    train_dataset = CustomImageDataset(image_paths=train_files,
-                                       gauss_noise=True,
-                                       gauss_blur=True,
-                                       resize=128,
-                                       p=0.5,
-                                       center_crop=True,
-                                       transform=transform)
-    test_dataset = CustomImageDataset(image_paths=test_files,
-                                      gauss_noise=True,
-                                      gauss_blur=True,
-                                      resize=128,
-                                      p=0.5,
-                                      center_crop=True,
-                                      transform=transform)
-    
-    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-    
-    return trainloader, testloader
+import ray
+from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+from ray.air import session
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
+ray.shutdown()
+ray.init(num_gpus=1, ignore_reinit_error=True)
+
+def short_dirname(trial):
+    return "trial_" + str(trial.trial_id)
 
 def train_model(config):
     # Extract hyperparameters from config
@@ -234,95 +273,149 @@ def train_model(config):
     lr = config["lr"]
     batch_size = config["batch_size"]
     num_epochs = config["num_epochs"]
-    optimizer_name = config["optimizer"]
+    optimizer = config["optimizer"]
     
-    # Load data
-    data_dir = os.path.abspath("data/img_align_celeba")  # Make sure this path is correct
-    trainloader, testloader = load_data(data_dir, batch_size)
-    
+    # Transform
+    transform = transforms.Compose([transforms.ToTensor()])
+
+    # Split data
+    train_files, test_files = train_test_split(image_paths, test_size=0.2, random_state=42)
+    train_dataset = CustomImageDataset(image_paths=train_files,
+                                gauss_noise=True,
+                                gauss_blur=True,
+                                resize=128,
+                                p=0.5,
+                                center_crop=True,
+                                transform=transform)
+    test_dataset = CustomImageDataset(image_paths=test_files,
+                                gauss_noise=True,
+                                gauss_blur=True,
+                                resize=128,
+                                p=0.5,
+                                center_crop=True,
+                                transform=transform)
+    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    # Verify dataset output shapes
+    train_batch, train_gt = next(iter(trainloader))
+    test_batch, test_gt = next(iter(testloader)) 
+
+    # print(f"Train batch shape: {train_batch.shape}")
+    # print(f"Train GT batch shape: {train_gt.shape}")
+    # print(f"Test batch shape: {test_batch.shape}")
+    # print(f"Test GT batch shape: {test_gt.shape}")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Autoencoder(architecture).to(device)
+    model = Autoencoder(architecture)  # Ensure the model architecture is consistent
+    model = model.to(device)
     loss_fn = nn.MSELoss()
     
-    if optimizer_name == 'Adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    elif optimizer_name == 'SGD':
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-    
+    if optimizer == 'Adam':
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+    elif optimizer == 'SGD':
+        opt = torch.optim.SGD(model.parameters(), lr=lr)
+        
     for epoch in range(num_epochs):
         model.train()
-        train_loss = 0.0
-        for batch, gt_img in trainloader:
-            batch, gt_img = batch.to(device), gt_img.to(device)
-            optimizer.zero_grad()
-            outputs = model(batch)
-            loss = loss_fn(outputs, gt_img)
+        avg_train_loss = 0
+        avg_test_loss = 0
+        for batch in trainloader:
+            images, train_gt_img = batch  # unpack the batch
+            
+            # Print shapes for debugging
+            # print(f"Training image shape: {images.shape}")
+            # print(f"Training GT image shape: {train_gt_img.shape}")
+
+            # Move data to the device
+            images = images.to(device)
+            train_gt_img = train_gt_img.to(device)
+            
+            # Forward pass
+            output = model(images)
+            
+            # Print model output shape for debugging
+            # print(f"Model output shape: {output.shape}")
+            
+            # Compute the loss
+            loss = loss_fn(output, train_gt_img)
+            
+            # Backpropagation and optimization step
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            opt.step()
+
+            # Track the training loss
+            avg_train_loss += loss.item()
+            
+        avg_train_loss /= len(trainloader)
         
+        total_psnr = 0
+        total_ssim = 0
         model.eval()
-        val_loss = 0.0
-        total_psnr = 0.0
-        total_ssim = 0.0
         with torch.no_grad():
-            for batch, gt_img in testloader:
-                batch, gt_img = batch.to(device), gt_img.to(device)
-                outputs = model(batch)
-                loss = loss_fn(outputs, gt_img)
-                val_loss += loss.item()
+            for batch in testloader:
+                images, test_gt_img = batch  # Unpack test batch
                 
-                # Calculate PSNR and SSIM
-                img_np = gt_img.cpu().numpy().transpose(0, 2, 3, 1)
-                out_np = outputs.cpu().numpy().transpose(0, 2, 3, 1)
-                total_psnr += psnr(img_np, out_np, data_range=1.0)
-                total_ssim += ssim(img_np, out_np, data_range=1.0, multichannel=True)
+                # Print shapes for debugging
+                print(f"Testing image shape: {images.shape}")
+                print(f"Testing GT image shape: {test_gt_img.shape}")
+                
+                # Move data to the device
+                images = images.to(device)
+                test_gt_img = test_gt_img.to(device)
+                
+                # Forward pass
+                output = model(images)
+                
+                # Compute the loss for test data
+                loss = loss_fn(output, test_gt_img)
+                avg_test_loss += loss.item()
+                
+                # Convert tensors to numpy arrays for PSNR and SSIM calculations
+                output_np = output.cpu().numpy().transpose(0, 2, 3, 1)
+                images_np = test_gt_img.cpu().numpy().transpose(0, 2, 3, 1)
+                
+                # Calculate PSNR and SSIM for each image in the batch
+                for i in range(batch_size):
+                    img = images_np[i]
+                    rec_img = output_np[i]
+                    total_psnr += psnr(img, rec_img, data_range=1.0)
+                    total_ssim += ssim(img, rec_img, data_range=1.0, multichannel=True)
         
-        avg_train_loss = train_loss / len(trainloader)
-        avg_val_loss = val_loss / len(testloader)
-        avg_psnr = total_psnr / len(testloader)
-        avg_ssim = total_ssim / len(testloader)
+        # Average the PSNR, SSIM, and loss over the test dataset
+        avg_psnr = total_psnr / (len(testloader) * batch_size)
+        avg_ssim = total_ssim / (len(testloader) * batch_size)
+        avg_test_loss /= len(testloader)
         
         # Report results to Ray Tune
         session.report({
             "train_loss": avg_train_loss,
-            "val_loss": avg_val_loss,
+            "val_loss": avg_test_loss,
             "val_psnr": avg_psnr,
             "val_ssim": avg_ssim,
         })
 
-# Ray Tune setup
-ray.shutdown()
-ray.init(num_gpus=1, ignore_reinit_error=True)
-
+# config = {
+#     'architecture': tune.choice([[32, 64, 128], [64, 128, 256], [64, 128, 256, 512]]),
+#     "lr": tune.grid_search([1e-3, 1e-4, 1e-2]),
+#     "batch_size": tune.grid_search([16, 32]),
+#     "num_epochs": tune.grid_search([1, 2, 3]),
+#     'optimizer': tune.choice(['Adam', 'SGD']),
+# }
 config = {
-    'architecture': tune.choice([[32, 64, 128], [64, 128, 256], [64, 128, 256, 512]]),
-    "lr": tune.loguniform(1e-4, 1e-2),
-    "batch_size": tune.choice([16, 32]),
-    "num_epochs": tune.choice([10, 50, 100]),
-    'optimizer': tune.choice(['Adam', 'SGD']),
+    'architecture': tune.grid_search([[32, 64, 128], [64, 128, 256], [64, 128, 256, 512]]),
+    "lr": tune.grid_search([1e-3, 1e-4, 1e-2]),
+    "batch_size": tune.grid_search([16, 32]),
+    "num_epochs": tune.grid_search([1, 2, 3]),
+    'optimizer': tune.grid_search(['Adam', 'SGD']),
 }
 
-scheduler = ASHAScheduler(
-    max_t=100,
-    grace_period=10,
-    reduction_factor=2)
-
-tuner = tune.Tuner(
-    train_model,
-    tune_config=tune.TuneConfig(
-        metric="val_loss",
-        mode="min",
-        scheduler=scheduler,
-        num_samples=10,
-    ),
-    param_space=config,
+result = tune.run(
+    tune.with_resources(train_model, resources={"gpu": 1}),
+    config=config,
+    metric="val_psnr",
+    mode="max",
+    trial_dirname_creator=short_dirname
 )
-
-results = tuner.fit()
-
-print("Best hyperparameters found were: ", results.get_best_result().config)
-
-# # Visualization function (if needed)
-# def imshow_grid(images):
-#     # ... (your existing implementation)
+print("Best config: ", result.get_best_config(metric="val_psnr", mode="max"))
