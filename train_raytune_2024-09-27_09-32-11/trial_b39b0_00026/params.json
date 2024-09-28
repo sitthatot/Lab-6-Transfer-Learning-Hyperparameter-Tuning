@@ -1,0 +1,11 @@
+{
+  "architecture": [
+    64,
+    128,
+    256
+  ],
+  "batch_size": 20,
+  "lr": 0.0067479008974942285,
+  "num_epochs": 85,
+  "optimizer": "Adam"
+}

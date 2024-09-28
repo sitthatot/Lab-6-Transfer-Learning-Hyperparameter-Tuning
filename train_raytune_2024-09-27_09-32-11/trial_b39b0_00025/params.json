@@ -1,0 +1,11 @@
+{
+  "architecture": [
+    32,
+    64,
+    128
+  ],
+  "batch_size": 17,
+  "lr": 0.008388244048087677,
+  "num_epochs": 73,
+  "optimizer": "SGD"
+}
